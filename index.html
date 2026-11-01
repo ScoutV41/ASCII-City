@@ -1,0 +1,614 @@
+
+ASCICITY.html
+
+100%
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>ASCII CITY - Tokyo Edition</title>
+<style>
+  html,body{margin:0;padding:0;background:#000;overflow:hidden;height:100%;width:100%;}
+  #wrap{position:relative;width:100vw;height:100vh;background:#000;}
+  canvas{display:block;}
+  #hud{
+    position:absolute;top:10px;left:10px;color:#7fffb0;font-family:monospace;
+    font-size:12px;line-height:1.4;background:rgba(0,0,0,0.65);padding:8px 12px;
+    border:1px solid #234;pointer-events:none;white-space:pre;box-shadow: 0 0 10px rgba(0,0,0,0.8);
+  }
+  #hint{
+    position:absolute;bottom:10px;left:50%;transform:translateX(-50%);
+    color:#5c8;font-family:monospace;font-size:12px;background:rgba(0,0,0,0.65);
+    padding:6px 10px;border:1px solid #234;pointer-events:none;
+  }
+  #startScreen{
+    position:absolute;inset:0;background:rgba(0,0,0,0.88);color:#8ff0b8;
+    font-family:monospace;display:flex;flex-direction:column;align-items:center;
+    justify-content:center;text-align:center;cursor:pointer;z-index:5;
+  }
+  #startScreen h1{font-size:32px;letter-spacing:6px;margin:0 0 10px;color:#ffe36b;}
+  #startScreen p{margin:4px;font-size:13px;color:#8ff0b8;}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="c"></canvas>
+  <div id="hud"></div>
+  <div id="hint">WASD move &nbsp;|&nbsp; MOUSE / arrow keys look &nbsp;|&nbsp; click canvas to lock mouse</div>
+  <div id="startScreen">
+    <h1>A S C I I &nbsp; C I T Y</h1>
+    <p>procedurally generated infinite Tokyo metropolis</p>
+    <p style="color:#ffe36b;">shibuya scrambles &middot; conbini &middot; landmarks &middot; dense transit</p>
+    <p style="margin-top:16px; border: 1px solid #ffe36b; padding: 6px 12px;">click to enter</p>
+  </div>
+</div>
+
+<script>
+(function(){
+"use strict";
+
+// ---------------------------------------------------------------
+// CONFIG & GRID TUNING
+// ---------------------------------------------------------------
+let COLS = 120, ROWS = 55, CHAR_W = 8, CHAR_H = 14;
+const TARGET_CELL_CSS = 6.0;     
+const MIN_COLS = 100, MAX_COLS = 220;
+const MIN_ROWS = 45, MAX_ROWS = 90;
+const FOV = 1.15;
+const MAX_DIST = 52;             
+let BASE_HORIZON = ROWS * 0.52;
+const MOVE_SPEED = 3.6;
+const TURN_SPEED = 2.4;
+const MOUSE_SENS = 0.0022;
+const PITCH_MAX = 0.9;
+const HEIGHT_SCALE = 4.1;      
+const RESPAWN_RADIUS = 50;      
+const SPAWN_RADIUS = 28;
+
+// Tokyo Grid Settings
+const MINOR = 6;                
+const MAJOR = 26;               
+const PLAZA_RADIUS = 5;         
+const LANDMARK_GRID = 13;       
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let bufChar, bufColor, nearestDist;
+
+function resizeCanvas(){
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const cssW = window.innerWidth, cssH = window.innerHeight;
+  COLS = Math.max(MIN_COLS, Math.min(MAX_COLS, Math.round(cssW / TARGET_CELL_CSS)));
+  ROWS = Math.max(MIN_ROWS, Math.min(MAX_ROWS, Math.round(cssH / (TARGET_CELL_CSS*1.6))));
+  CHAR_W = cssW / COLS;
+  CHAR_H = cssH / ROWS;
+  BASE_HORIZON = ROWS * 0.52;
+
+  canvas.style.width = cssW + 'px';
+  canvas.style.height = cssH + 'px';
+  canvas.width = Math.round(cssW * dpr);
+  canvas.height = Math.round(cssH * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  
+  bufChar = new Array(COLS*ROWS);
+  bufColor = new Array(COLS*ROWS);
+  nearestDist = new Float32Array(COLS);
+}
+resizeCanvas();
+window.addEventListener('resize', resizeCanvas);
+
+// ---------------------------------------------------------------
+// MAP GENERATION & WORLD LOGIC
+// ---------------------------------------------------------------
+function hash2(x, y, seed){
+  let n = (x|0) * 374761393 + (y|0) * 668265263 + seed * 982451653;
+  n = (n ^ (n >> 13)) * 1274126177;
+  n = n ^ (n >> 16);
+  return ((n >>> 0) % 100000) / 100000;
+}
+
+function distToMultiple(n, spacing){
+  const m = ((n % spacing) + spacing) % spacing;
+  return Math.min(m, spacing - m);
+}
+
+function isMajorRoad(x,y){ return distToMultiple(x,MAJOR) <= 2 || distToMultiple(y,MAJOR) <= 2; }
+function isMinorRoad(x,y){ return distToMultiple(x,MINOR) <= 0 || distToMultiple(y,MINOR) <= 0; }
+
+function isSidewalk(x,y){
+  if(isMajorRoad(x,y) || isMinorRoad(x,y)) return false;
+  return distToMultiple(x,MAJOR) === 3 || distToMultiple(y,MAJOR) === 3 ||
+         distToMultiple(x,MINOR) === 1 || distToMultiple(y,MINOR) === 1;
+}
+
+function isShibuyaCrossing(x,y){
+  const nx = Math.round(x/MAJOR)*MAJOR, ny = Math.round(y/MAJOR)*MAJOR;
+  return Math.max(Math.abs(x-nx), Math.abs(y-ny)) <= PLAZA_RADIUS;
+}
+
+function getDistrict(x,y){
+  const bx = Math.floor(x/MAJOR), by = Math.floor(y/MAJOR);
+  const r = hash2(bx,by,201);
+  if(r < 0.45) return 'shibuya';     
+  if(r < 0.70) return 'residential'; 
+  if(r < 0.85) return 'industrial';  
+  return 'park';                     
+}
+
+function landmarkAt(x,y){
+  const ccx = Math.round(x/LANDMARK_GRID)*LANDMARK_GRID;
+  const ccy = Math.round(y/LANDMARK_GRID)*LANDMARK_GRID;
+  if(isMajorRoad(ccx,ccy) || isMinorRoad(ccx,ccy)) return null;
+  if(hash2(ccx,ccy,301) > 0.65) return null; 
+  
+  const t = hash2(ccx,ccy,302);
+  const type = t < 0.40 ? 'conbini' : (t < 0.75 ? 'station' : 'gas');
+  const footprint = type === 'station' ? 3 : (type === 'gas' ? 2 : 1);
+  if(Math.max(Math.abs(x-ccx), Math.abs(y-ccy)) <= footprint) return type;
+  return null;
+}
+
+function propAt(x,y){
+  if(!isSidewalk(x,y)) return null;
+  const r = hash2(x,y,888);
+  if(r < 0.04) return 'vending';
+  if(r < 0.08) return 'lamp';
+  if(r < 0.12) return 'bench';
+  if(r < 0.20) return 'tree';
+  return null;
+}
+
+function computeCell(x,y){
+  if(isShibuyaCrossing(x,y)) return {walkable:true, kind:'shibuya', height:0};
+  if(isMajorRoad(x,y))       return {walkable:true, kind:'avenue', height:0};
+  if(isMinorRoad(x,y))       return {walkable:true, kind:'street', height:0};
+
+  const prop = propAt(x,y);
+  // FIX: All sidewalk props (including trees) are now entirely walkable! No collisions.
+  if(prop) return {walkable:true, kind:'sidewalk_prop', propType:prop, height:0}; 
+  if(isSidewalk(x,y)) return {walkable:true, kind:'sidewalk', height:0};
+
+  const lm = landmarkAt(x,y);
+  if(lm === 'station') return {walkable:false, kind:'building', height:8, paletteId:'station'};
+  if(lm === 'gas')     return {walkable:false, kind:'building', height:3, paletteId:'gas'};
+  if(lm === 'conbini') return {walkable:false, kind:'building', height:3, paletteId:'conbini'};
+
+  const district = getDistrict(x,y);
+  if(district === 'park'){
+    return {walkable:true, kind:'field'};
+  }
+  if(district === 'residential'){
+    const h = 4 + Math.floor(hash2(x,y,61)*6);
+    return {walkable:false, kind:'building', height:h, paletteId:'brick'};
+  }
+  if(district === 'industrial'){
+    const gx = Math.floor(x/2), gy = Math.floor(y/2);
+    const h = 3 + Math.floor(hash2(gx,gy,71)*4);
+    return {walkable:false, kind:'building', height:h, paletteId:'steel'};
+  }
+  
+  const r = hash2(x,y,17);
+  let h;
+  if(r < 0.35) h = 5 + Math.floor(hash2(x,y,5) * 6);
+  else if(r < 0.75) h = 12 + Math.floor(hash2(x,y,6) * 12);
+  else h = 24 + Math.floor(hash2(x,y,7) * 22);
+  const styleId = Math.floor(hash2(x,y,91)*3);
+  return {walkable:false, kind:'building', height:h, paletteId:'downtown'+styleId};
+}
+
+function isWalkable(x,y){ return computeCell(x,y).walkable; }
+
+// ---------------------------------------------------------------
+// PLAYER / CAMERA
+// ---------------------------------------------------------------
+const player = { x: 0.5, y: 0.5, angle: 0.6, pitch: 0 };
+(function placeStart(){
+  for(let r=0;r<60;r++){
+    for(let x=-r;x<=r;x++){
+      if(isWalkable(x, -r)){ player.x=x+0.5; player.y=-r+0.5; return; }
+    }
+  }
+})();
+
+// ---------------------------------------------------------------
+// ENTITIES & MOVEMENT
+// ---------------------------------------------------------------
+const dynamicSprites = [];
+function nearestRoadLine(coord, spacing){ return Math.round(coord/spacing)*spacing; }
+
+function respawnSprite(s){
+  const horizontal = Math.random() < 0.5;
+  const anchorCoord = horizontal ? player.y : player.x;
+  const travelCoord = horizontal ? player.x : player.y;
+  const onAvenue = s.kind === 'car' && Math.random() < 0.4;
+  const spacing = onAvenue ? MAJOR : MINOR;
+  
+  s.speed = s.kind === 'car'
+    ? (onAvenue ? (4.2 + Math.random()*2.5) : (2.4 + Math.random()*1.6))
+    : (0.7 + Math.random()*0.5);
+  s.horizontal = horizontal;
+  
+  let line, offset, ok = false;
+  for(let tries=0; tries<8 && !ok; tries++){
+    line = nearestRoadLine(anchorCoord + (Math.random()<0.5?-1:1)*spacing*(1+Math.floor(Math.random()*3)), spacing);
+    offset = s.kind === 'car' ? (Math.random()<0.5 ? -0.8 : 0.8) : (Math.random()<0.5 ? -1.8 : 1.8);
+    const tx = horizontal ? travelCoord : line+0.5+offset;
+    const ty = horizontal ? line+0.5+offset : travelCoord;
+    ok = isWalkable(Math.floor(tx), Math.floor(ty));
+  }
+  s.fixedLine = line; s.offset = offset;
+  s.dir = Math.random() < 0.5 ? 1 : -1;
+  s.pos = travelCoord + (Math.random()*2-1) * SPAWN_RADIUS;
+}
+
+function makeMover(kind){
+  const s = { kind };
+  if(kind === 'car'){
+    s.color = Math.random() < 0.3 ? '#ff3355' : (Math.random() < 0.6 ? '#ffee44' : '#44ddff') ;
+  } else {
+    s.glyph = Math.random()<0.5 ? 'o' : 'i';
+    s.color = '#7fffb0';
+  }
+  respawnSprite(s);
+  return s;
+}
+
+for(let i=0;i<24;i++) dynamicSprites.push(makeMover('car'));
+for(let i=0;i<22;i++) dynamicSprites.push(makeMover('ped'));
+
+function updateSprites(dt){
+  for(const s of dynamicSprites){
+    s.pos += s.dir * s.speed * dt;
+    if(s.horizontal){ s.wx = s.pos; s.wy = s.fixedLine + 0.5 + s.offset; }
+    else            { s.wy = s.pos; s.wx = s.fixedLine + 0.5 + s.offset; }
+    const d = Math.hypot(s.wx-player.x, s.wy-player.y);
+    if(d > RESPAWN_RADIUS) respawnSprite(s);
+  }
+}
+
+// ---------------------------------------------------------------
+// INPUT HANDLING
+// ---------------------------------------------------------------
+const keys = {};
+window.addEventListener('keydown', e=>{ keys[e.code]=true; if(["ArrowUp","ArrowDown","ArrowLeft","ArrowRight","Space"].includes(e.code)) e.preventDefault(); });
+window.addEventListener('keyup', e=>{ keys[e.code]=false; });
+
+canvas.addEventListener('click', ()=>{ canvas.requestPointerLock(); });
+document.addEventListener('mousemove', e=>{
+  if(document.pointerLockElement === canvas){
+    player.angle += e.movementX * MOUSE_SENS;
+    player.pitch -= e.movementY * MOUSE_SENS * 1.4;
+    player.pitch = Math.max(-PITCH_MAX, Math.min(PITCH_MAX, player.pitch));
+  }
+});
+document.getElementById('startScreen').addEventListener('click', function(){
+  this.style.display = 'none';
+  canvas.requestPointerLock();
+});
+
+function tryMove(dx, dy){
+  const r = 0.2;
+  if(dx !== 0){
+    const nx = player.x + dx;
+    if(isWalkable(Math.floor(nx + Math.sign(dx)*r), Math.floor(player.y))) player.x = nx;
+  }
+  if(dy !== 0){
+    const ny = player.y + dy;
+    if(isWalkable(Math.floor(player.x), Math.floor(ny + Math.sign(dy)*r))) player.y = ny;
+  }
+}
+
+function updatePlayer(dt){
+  if(keys['ArrowLeft'])  player.angle -= TURN_SPEED*dt;
+  if(keys['ArrowRight']) player.angle += TURN_SPEED*dt;
+  if(keys['ArrowUp'])   { player.pitch = Math.min(PITCH_MAX, player.pitch + TURN_SPEED*0.6*dt); }
+  if(keys['ArrowDown']) { player.pitch = Math.max(-PITCH_MAX, player.pitch - TURN_SPEED*0.6*dt); }
+  let fwd = 0, strafe = 0;
+  if(keys['KeyW']) fwd += 1;
+  if(keys['KeyS']) fwd -= 1;
+  if(keys['KeyD']) strafe += 1;
+  if(keys['KeyA']) strafe -= 1;
+  if(fwd || strafe){
+    const len = Math.hypot(fwd,strafe) || 1;
+    fwd/=len; strafe/=len;
+    const dx = (Math.cos(player.angle)*fwd + Math.cos(player.angle+Math.PI/2)*strafe) * MOVE_SPEED*dt;
+    const dy = (Math.sin(player.angle)*fwd + Math.sin(player.angle+Math.PI/2)*strafe) * MOVE_SPEED*dt;
+    tryMove(dx, dy);
+  }
+}
+
+// ---------------------------------------------------------------
+// COLOR & SHADING PALETTES
+// ---------------------------------------------------------------
+const PALETTES = {
+  downtown0: {ns:'#3fa0ff', ew:'#1c5fb8', glyphs:['8','X','x','+','.']},
+  downtown1: {ns:'#e8e04a', ew:'#8f8a20', glyphs:['0','8','X','x','.']},
+  downtown2: {ns:'#7fe0a0', ew:'#2f8f5a', glyphs:['#','8','x','+','.']},
+  brick:     {ns:'#e0816a', ew:'#a84c3a', glyphs:['#','H','x','+','.']},
+  steel:     {ns:'#b9c2c9', ew:'#707880', glyphs:['=','8','x','-','.']},
+  station:   {ns:'#ffffff', ew:'#a7a7c6', glyphs:['#','H','=','+','.']},
+  gas:       {ns:'#ff4a4a', ew:'#b92c2c', glyphs:['G','^','+','.',' ']},
+  conbini:   {ns:'#70ff8a', ew:'#2fbf5a', glyphs:['7','+','-','.',' ']},
+};
+
+function dimColor(hex, dist){
+  const t = Math.min(Math.max(dist,0) / MAX_DIST, 1);
+  const f = Math.max(0, 1 - t*0.82);
+  const r = parseInt(hex.substr(1,2),16), g = parseInt(hex.substr(3,2),16), b = parseInt(hex.substr(5,2),16);
+  return `rgb(${(r*f)|0},${(g*f)|0},${(b*f)|0})`;
+}
+
+// ---------------------------------------------------------------
+// RAYCASTING ENGINE (Walls & Floor Only)
+// ---------------------------------------------------------------
+let horizonRow = Math.round(BASE_HORIZON);
+
+function setCell(col,row,ch,color){
+  if(row<0||row>=ROWS||col<0||col>=COLS) return;
+  bufChar[row*COLS+col] = ch;
+  bufColor[row*COLS+col] = color;
+}
+
+function castColumn(col){
+  const rayAngle = player.angle - FOV/2 + (col/COLS)*FOV;
+  const dirX = Math.cos(rayAngle), dirY = Math.sin(rayAngle);
+  let mapX = Math.floor(player.x), mapY = Math.floor(player.y);
+  const deltaDistX = Math.abs(1/dirX), deltaDistY = Math.abs(1/dirY);
+  let stepX, stepY, sideDistX, sideDistY;
+  
+  if(dirX < 0){ stepX = -1; sideDistX = (player.x - mapX) * deltaDistX; }
+  else { stepX = 1; sideDistX = (mapX + 1 - player.x) * deltaDistX; }
+  if(dirY < 0){ stepY = -1; sideDistY = (player.y - mapY) * deltaDistY; }
+  else { stepY = 1; sideDistY = (mapY + 1 - player.y) * deltaDistY; }
+
+  let filledTo = horizonRow;
+  let firstHitRecorded = false;
+  let dist = 0, side = 0;
+
+  for(let steps=0; steps<110 && filledTo>0 && dist<MAX_DIST; steps++){
+    if(sideDistX < sideDistY){
+      sideDistX += deltaDistX; mapX += stepX; side = 0; dist = sideDistX - deltaDistX;
+    } else {
+      sideDistY += deltaDistY; mapY += stepY; side = 1; dist = sideDistY - deltaDistY;
+    }
+    const cell = computeCell(mapX,mapY);
+    
+    // Ignore 0-height props completely for walls
+    if(cell.walkable || cell.kind === 'sidewalk_prop') continue;
+
+    const perp = Math.max(0.0001, dist * Math.cos(rayAngle - player.angle));
+    if(!firstHitRecorded){ nearestDist[col] = perp; firstHitRecorded = true; }
+
+    const projHeight = (ROWS * cell.height) / (perp * HEIGHT_SCALE);
+    let topRowInt = Math.round(horizonRow - projHeight);
+    if(topRowInt < 0) topRowInt = 0;
+    if(topRowInt > filledTo) continue;
+
+    if(topRowInt < filledTo){
+      const pal = PALETTES[cell.paletteId] || PALETTES.downtown0;
+      const baseColor = side===0 ? pal.ns : pal.ew;
+      const shadeIdx = Math.min(pal.glyphs.length-1, Math.floor(Math.min(perp/MAX_DIST,1)*pal.glyphs.length));
+      const buildingSeed = mapX*97 + mapY*131 + side*7919;
+      
+      for(let r = topRowInt; r < filledTo; r++){
+        const worldH = Math.max(0, (horizonRow - r) * perp * HEIGHT_SCALE / ROWS);
+        const floorUnit = Math.floor(worldH * 1.6);
+        const lit = hash2(buildingSeed, floorUnit, 501) < 0.45;
+        const ch = lit ? pal.glyphs[Math.max(0, shadeIdx-1)] : pal.glyphs[Math.min(pal.glyphs.length-1, shadeIdx+1)];
+        const color = dimColor(baseColor, lit ? perp*0.5 : perp*1.2);
+        setCell(col, r, ch, color);
+      }
+      filledTo = topRowInt;
+    }
+  }
+  if(!firstHitRecorded) nearestDist[col] = MAX_DIST + 1;
+
+  for(let r=0; r<filledTo; r++){
+    const tw = hash2(col, r, 3) < 0.02 ? '.' : ' ';
+    setCell(col, r, tw, '#0b1021');
+  }
+}
+
+function castFloor(){
+  const dirX0 = Math.cos(player.angle - FOV/2), dirY0 = Math.sin(player.angle - FOV/2);
+  const dirX1 = Math.cos(player.angle + FOV/2), dirY1 = Math.sin(player.angle + FOV/2);
+  
+  for(let row = horizonRow; row < ROWS; row++){
+    const rowFrac = row - horizonRow + 1;
+    const rowDist = (ROWS*0.42) / rowFrac;
+    const floorStepX = rowDist*(dirX1-dirX0)/COLS;
+    const floorStepY = rowDist*(dirY1-dirY0)/COLS;
+    let fx = player.x + rowDist*dirX0;
+    let fy = player.y + rowDist*dirY0;
+    
+    for(let col=0; col<COLS; col++){
+      fx += floorStepX; fy += floorStepY;
+      const cellX = Math.floor(fx), cellY = Math.floor(fy);
+      const cell = computeCell(cellX,cellY);
+      const checker = (cellX + cellY) % 2 === 0;
+      let ch = ' ', color = '#000';
+
+      if(cell.kind === 'shibuya'){
+        const nx = Math.round(fx/MAJOR)*MAJOR, ny = Math.round(fy/MAJOR)*MAJOR;
+        const lx = fx-nx, ly = fy-ny;
+        if(Math.abs(lx) < 1.2 && Math.abs(ly) < 1.2){
+          ch = '+'; color = dimColor('#ffffff', rowDist);
+        } else if(Math.abs(lx) < 2.2 || Math.abs(ly) < 2.2){
+          ch = (Math.floor(fx*3)+Math.floor(fy*3))%2===0 ? '|' : '=';
+          color = dimColor('#ffe890', rowDist);
+        } else {
+          ch = checker ? '=' : '||';
+          color = dimColor('#e0e0e0', rowDist);
+        }
+      } else if(cell.kind === 'avenue'){
+        ch = checker ? '=' : '-';
+        color = dimColor('#a0a0b0', rowDist);
+      } else if(cell.kind === 'street'){
+        ch = checker ? ':' : '.';
+        color = dimColor('#7a7a85', rowDist);
+      } else if(cell.kind === 'sidewalk' || cell.kind === 'sidewalk_prop'){
+        ch = checker ? '#' : '+';
+        color = dimColor('#807565', rowDist);
+      } else if(cell.kind === 'field'){
+        ch = checker ? ',' : '.';
+        color = dimColor('#3f8a4c', rowDist);
+      } else {
+        ch = '.';
+        color = dimColor('#22222a', rowDist);
+      }
+      
+      if(rowDist > 35 && Math.random() < 0.2) ch = '.';
+      setCell(col,row,ch,color);
+    }
+  }
+}
+
+// ---------------------------------------------------------------
+// OVERLAY SPRITE RENDERER (Fixed Scaling & Positioning)
+// ---------------------------------------------------------------
+function drawSpritesOverlay(){
+  const allSprites = [];
+  
+  // Add dynamic movers
+  for(const s of dynamicSprites){
+    allSprites.push({s, wx: s.wx, wy: s.wy});
+  }
+
+  // Scan local grid for static props
+  const pX = Math.floor(player.x), pY = Math.floor(player.y);
+  for(let dx = -30; dx <= 30; dx++){
+    for(let dy = -30; dy <= 30; dy++){
+      if(dx*dx + dy*dy > 900) continue; 
+      const cx = pX + dx, cy = pY + dy;
+      if(isSidewalk(cx, cy)){
+        const prop = propAt(cx, cy);
+        if(prop) allSprites.push({s: {kind: prop}, wx: cx+0.5, wy: cy+0.5});
+      }
+    }
+  }
+
+  const sorted = allSprites.map(obj=>{
+    const dx = obj.wx - player.x, dy = obj.wy - player.y;
+    const dist = Math.hypot(dx,dy);
+    let angleTo = Math.atan2(dy,dx) - player.angle;
+    while(angleTo > Math.PI) angleTo -= 2*Math.PI;
+    while(angleTo < -Math.PI) angleTo += 2*Math.PI;
+    return {s: obj.s, dist, angleTo};
+  }).filter(o => Math.abs(o.angleTo) < FOV/1.3 && o.dist < MAX_DIST && o.dist>0.3)
+    .sort((a,b)=> b.dist - a.dist);
+
+  for(const {s,dist,angleTo} of sorted){
+    const col = Math.floor((0.5 + angleTo/FOV) * COLS);
+    if(col<0||col>=COLS) continue;
+    
+    // Check if behind a wall (allow 0.4 buffer to prevent sudden popping)
+    if(dist > nearestDist[col] + 0.4) continue;
+
+    // Calculate actual screen Y based on floor projection
+    const rowFrac = (ROWS * 0.42) / dist;
+    const spriteFloorRow = horizonRow - 1 + rowFrac;
+    const screenY = spriteFloorRow * CHAR_H;
+    const screenX = col * CHAR_W;
+
+    // FIX: Dynamically scale font size inversely proportional to distance
+    const fontSize = Math.max(CHAR_H * 0.5, Math.min(300, (CHAR_H * 14) / dist));
+    
+    ctx.font = "bold " + Math.floor(fontSize) + "px monospace";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "bottom"; // Anchor the scaling to the ground
+
+    let text = '';
+    let color = '#fff';
+
+    if(s.kind === 'car'){
+      text = s.horizontal ? (s.dir > 0 ? "o==o>" : "<o==o") : "[O]";
+      color = s.color;
+    } else if(s.kind === 'ped') {
+      text = s.glyph;
+      color = s.color;
+    } else if(s.kind === 'tree') {
+      text = 'Y';
+      color = '#4fd866';
+    } else if(s.kind === 'vending') {
+      text = '#';
+      color = '#ff4455';
+    } else if(s.kind === 'lamp') {
+      text = 'i';
+      color = '#ffffaa';
+    } else if(s.kind === 'bench') {
+      text = '_';
+      color = '#ffaa44';
+    }
+
+    ctx.fillStyle = dimColor(color, dist * 0.7);
+    ctx.fillText(text, screenX, screenY);
+  }
+}
+
+// ---------------------------------------------------------------
+// MAIN GAME LOOP 
+// ---------------------------------------------------------------
+function render(){
+  horizonRow = Math.round(BASE_HORIZON - player.pitch * (ROWS*1.35));
+
+  bufChar.fill(' ');
+  bufColor.fill('#000');
+  
+  castFloor();
+  for(let col=0; col<COLS; col++) castColumn(col);
+
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  // Draw grid background
+  let lastColor = '';
+  ctx.font = Math.ceil(CHAR_H) + "px monospace";
+  ctx.textBaseline = "top";
+  ctx.textAlign = "left";
+  
+  for(let row=0; row<ROWS; row++){
+    const rowY = row * CHAR_H;
+    for(let col=0; col<COLS; col++){
+      const ch = bufChar[row*COLS+col];
+      if(ch !== ' '){
+        const color = bufColor[row*COLS+col];
+        if(color !== lastColor){
+          ctx.fillStyle = color;
+          lastColor = color;
+        }
+        ctx.fillText(ch, col*CHAR_W, rowY);
+      }
+    }
+  }
+
+  // Draw dynamically scaled sprites on top
+  drawSpritesOverlay();
+}
+
+let last = performance.now();
+const hud = document.getElementById('hud');
+
+function frame(now){
+  const dt = Math.min(0.05, (now-last)/1000);
+  last = now;
+  updatePlayer(dt);
+  updateSprites(dt);
+  render();
+  
+  hud.textContent =
+`ASCII CITY (TOKYO METROPOLIS)
+pos      (${player.x.toFixed(1)}, ${player.y.toFixed(1)})
+district ${getDistrict(Math.floor(player.x), Math.floor(player.y)).toUpperCase()}
+ang      ${(player.angle*180/Math.PI).toFixed(0)}deg
+pitch    ${(player.pitch*180/Math.PI).toFixed(0)}deg
+fps      ${(1/dt).toFixed(0)}`;
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+})();
+</script>
+</body>
+</html>
+Displaying ASCICITY.html.
